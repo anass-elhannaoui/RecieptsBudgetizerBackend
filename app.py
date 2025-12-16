@@ -126,6 +126,54 @@ Text:
 def health():
     return jsonify({"status": "ok"})
 
+def categorize_items_with_ai(items):
+    """Use AI to categorize extracted items"""
+    if not items:
+        return items
+    
+    # Build category list for the prompt
+    category_list = ", ".join(CATEGORIES)
+    
+    # Prepare items for AI
+    items_text = "\n".join([f"{i+1}. {item['description']}" for i, item in enumerate(items)])
+    
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": f"""You are a receipt item categorizer. Categorize each item into one of these categories: {category_list}
+
+Return ONLY a JSON array with category names in the same order as the input items. Example: ["Groceries", "Dining", "Transport"]"""
+            },
+            {
+                "role": "user",
+                "content": f"""Categorize these items:
+{items_text}"""
+            }
+        ],
+        max_tokens=500,
+        temperature=0.1
+    )
+    
+    # Parse response
+    result = response.choices[0].message.content.strip()
+    # Remove markdown code blocks if present
+    if result.startswith("```"):
+        result = result.split("```json")[1].split("```")[0].strip() if "```json" in result else result.split("```")[1].split("```")[0].strip()
+    
+    categories = json.loads(result)
+    
+    # Assign categories to items
+    for i, item in enumerate(items):
+        if i < len(categories):
+            category = categories[i]
+            item['category'] = category if category in CATEGORIES else 'Uncategorized'
+        else:
+            item['category'] = 'Uncategorized'
+    
+    return items
+
 @app.route("/api/scan", methods=["POST"])
 def scan_receipt():
     if 'file' not in request.files:
@@ -148,16 +196,25 @@ def scan_receipt():
         date = ""
         total = 0.0
         tax = 0.0
+        items = []
 
+        # Extract items using regex patterns
         for line in lines:
+            line_stripped = line.strip()
+            
+            # Skip empty lines
+            if not line_stripped:
+                continue
+            
+            # Check for total/subtotal
             if "subtotal" in line.lower() or "total" in line.lower():
                 try:
-                    # Extract numbers with regex
                     numbers = re.findall(r'\d+\.\d{2}', line)
                     if numbers:
                         total = float(numbers[-1])
                 except ValueError:
                     pass
+            # Check for tax
             elif "tax" in line.lower():
                 try:
                     numbers = re.findall(r'\d+\.\d{2}', line)
@@ -165,8 +222,54 @@ def scan_receipt():
                         tax = float(numbers[-1])
                 except ValueError:
                     pass
+            # Check for date
             elif re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', line):
-                date = line.strip()
+                date = line_stripped
+            # Try to extract items (lines with prices)
+            else:
+                # Pattern: description followed by price (e.g., "Milk $4.99" or "Bread 3.50")
+                price_match = re.search(r'(.*?)\s*[\$]?\s*(\d+[.,]\d{2})$', line_stripped)
+                if price_match:
+                    description = price_match.group(1).strip()
+                    price_str = price_match.group(2).replace(',', '.')
+                    
+                    # Filter out lines that are likely totals/subtotals
+                    if description and not any(word in description.lower() for word in ['total', 'subtotal', 'tax', 'balance', 'change', 'cash', 'card']):
+                        try:
+                            item_price = float(price_str)
+                            
+                            # Check for quantity pattern (e.g., "2 x Milk" or "2x Milk")
+                            qty_match = re.match(r'(\d+)\s*x\s*(.*)', description, re.IGNORECASE)
+                            if qty_match:
+                                quantity = int(qty_match.group(1))
+                                description = qty_match.group(2).strip()
+                                unit_price = round(item_price / quantity, 2)
+                            else:
+                                quantity = 1
+                                unit_price = item_price
+                            
+                            items.append({
+                                'description': description,
+                                'quantity': quantity,
+                                'unitPrice': unit_price,
+                                'total': item_price
+                            })
+                        except ValueError:
+                            pass
+
+        # Use AI to categorize items only if items were found
+        if items and AI_PARSING_ENABLED:
+            try:
+                items = categorize_items_with_ai(items)
+            except Exception as e:
+                print(f"AI categorization failed: {str(e)}")
+                # If AI fails, set all to Uncategorized
+                for item in items:
+                    item['category'] = 'Uncategorized'
+        elif items:
+            # No AI available, set all to Uncategorized
+            for item in items:
+                item['category'] = 'Uncategorized'
 
         return jsonify({
             "message": "Scan successful",
@@ -175,6 +278,7 @@ def scan_receipt():
             "date": date,
             "total": total,
             "tax": tax,
+            "items": items,
             "confidence": ocr_confidence
         })
 
