@@ -1,12 +1,13 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from PIL import Image
-import pytesseract
+from paddleocr import PaddleOCR
 import io
 import os
 import json
 import base64
 import re
+import numpy as np
 from dotenv import load_dotenv
 from groq import Groq
 from werkzeug.utils import secure_filename
@@ -17,7 +18,16 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}}) # Allow all origins for dev
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Users\yoga\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'
+# Initialize PaddleOCR with simple configuration
+# Using CPU mode and basic OCR (no document preprocessing)
+ocr = PaddleOCR(
+    use_angle_cls=True,
+    lang='en',
+    use_gpu=False,
+    show_log=False,
+    enable_mkldnn=False,
+    use_tensorrt=False
+)
 
 # Initialize Groq client
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -39,28 +49,51 @@ CATEGORIES = [
     "Uncategorized"
 ]
 
-def get_tesseract_confidence(image):
-    """Get word-level confidence from Tesseract"""
-    # Get detailed OCR data with confidence scores
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+def perform_ocr_with_paddleocr(image):
+    """Perform OCR using PaddleOCR and return text, confidence, and bounding boxes"""
+    # Convert PIL Image to numpy array
+    img_array = np.array(image)
     
-    # Filter out empty text and calculate average confidence
-    confidences = [
-        int(conf) for conf, text in zip(data['conf'], data['text']) 
-        if int(conf) > 0 and text.strip()
-    ]
+    # Perform OCR
+    result = ocr.ocr(img_array, cls=True)
     
-    if not confidences:
-        return 0.3
+    if not result or not result[0]:
+        return "", 0.3, []
     
-    avg_confidence = sum(confidences) / len(confidences) / 100  # Convert to 0-1 scale
-    return round(avg_confidence, 2)
+    # Extract text, confidence scores, and bounding boxes
+    full_text_lines = []
+    confidences = []
+    ocr_data = []
+    
+    for line in result[0]:
+        box, (text, confidence) = line
+        full_text_lines.append(text)
+        confidences.append(confidence)
+        
+        # Store detailed OCR data with bounding boxes
+        ocr_data.append({
+            'text': text,
+            'confidence': round(confidence, 3),
+            'bounding_box': {
+                'top_left': [int(box[0][0]), int(box[0][1])],
+                'top_right': [int(box[1][0]), int(box[1][1])],
+                'bottom_right': [int(box[2][0]), int(box[2][1])],
+                'bottom_left': [int(box[3][0]), int(box[3][1])]
+            }
+        })
+    
+    # Calculate average confidence
+    avg_confidence = sum(confidences) / len(confidences) if confidences else 0.3
+    
+    # Join all text lines
+    full_text = '\n'.join(full_text_lines)
+    
+    return full_text, round(avg_confidence, 3), ocr_data
 
 def parse_receipt_with_ai(image):
     """Parse receipt using OCR + OpenAI text parsing"""
-    # Step 1: OCR the image to get raw text and confidence
-    raw_text = pytesseract.image_to_string(image)
-    ocr_confidence = get_tesseract_confidence(image)
+    # Step 1: OCR the image to get raw text, confidence, and bounding boxes
+    raw_text, ocr_confidence, ocr_data = perform_ocr_with_paddleocr(image)
     
     # Check if OCR confidence is too low
     if ocr_confidence < MIN_OCR_CONFIDENCE:
@@ -116,9 +149,10 @@ Text:
         if 'category' not in item or item['category'] not in CATEGORIES:
             item['category'] = 'Uncategorized'
     
-    # Add the raw OCR text and confidence
+    # Add the raw OCR text, confidence, and bounding boxes
     parsed_data['raw_text'] = raw_text
     parsed_data['ocr_confidence'] = ocr_confidence
+    parsed_data['ocr_data'] = ocr_data
     
     return parsed_data
 
@@ -185,10 +219,9 @@ def scan_receipt():
 
     try:
         image = Image.open(file.stream)
-        raw_text = pytesseract.image_to_string(image)
         
-        # Get real Tesseract confidence score
-        ocr_confidence = get_tesseract_confidence(image)
+        # Perform OCR with PaddleOCR to get text, confidence, and bounding boxes
+        raw_text, ocr_confidence, ocr_data = perform_ocr_with_paddleocr(image)
 
         # Parse structured fields from raw_text
         lines = raw_text.splitlines()
@@ -279,7 +312,8 @@ def scan_receipt():
             "total": total,
             "tax": tax,
             "items": items,
-            "confidence": ocr_confidence
+            "confidence": ocr_confidence,
+            "ocr_data": ocr_data
         })
 
     except Exception as e:
